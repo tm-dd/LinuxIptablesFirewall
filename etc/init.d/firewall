@@ -1,0 +1,275 @@
+#!/bin/bash
+#
+# a simple linux iptables firewall script
+#
+# Copyright (c) 2020 tm-dd (Thomas Mueller)
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+#
+
+### BEGIN INIT INFO
+# Provides: firewall
+# Required-Start:
+# Required-Stop: networking
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Description: firewall script
+### END INIT INFO
+
+# READ CONFIG FILE
+source /etc/firewall.cfg
+
+case "$1" in
+
+start)
+
+	# START-AUSGABE
+	echo
+	echo "***** RULES OF THE FIREWALL ON $DEV1 *****"
+    echo
+	echo "  $DEV1 allows only initial connactions"
+	echo "    from the internal (see below) IPs to this ports:"
+	echo "	    tcp: $only_internal_tcp_dports"
+	echo "	    udp: $only_internal_udp_dports"
+	echo "    from all IPs, also to this ports:"
+	echo "	    tcp: $tcp_dports_for_all"
+	echo "	    udp: $udp_dports_for_all"
+	echo "  internal IPs: $internal_hosts"
+	echo "  special rules (HOST:PORT:TYP): $special_rules"
+	echo "  other protocols (for all hosts): $protocols_for_all"
+	echo "  IPs who can use NAT/PAT (e.g. for VPN services): $nat_pat_hosts"
+    echo "  ping is allowed for all IPs"
+	if [ "${logfile}" != "" ]; then echo "  the firewall will log access to: ${logfile}"; fi
+    echo
+	echo "  commands to run, before the firewall is starting:"
+	echo "    $own_commands_at_beginn"
+	echo "  commands to run, after the firewall was starting:"
+	echo "    $own_commands_before_nat_pat"
+	echo
+	echo "**************************************"
+	echo
+	
+	echo "STARTING firewall ..."
+	echo
+	
+	## RESET all old rules
+	
+	# ALLE IPTABLES- (Firewall-) Regeln loeschen
+	( set -x; iptables --flush )
+
+	# neue Kette "myfilter" erzeugen - gibt nur eine Fehlermeldung, wenn Kette schon vorhanden
+	( set -x; iptables -N myfilter )
+
+    # erlaube alles ueber das loopback-Interface
+    ( set -x; iptables -A myfilter -i lo -j ACCEPT )
+
+	## ERLAUBEN von Paketten
+
+	# fuehre Kommandos aus $own_commands_at_beginn aus (dies koennen z.B. zusaetzliche iptables-Regeln sein)
+	if [[ "$own_commands_at_beginn" != "" ]]
+	then
+                OIFS=$IFS
+                IFS=$'\n'
+                for run in $own_commands_at_beginn
+                do
+                        ( set -x; eval $run )
+                done
+                IFS=$OIFS
+	fi
+	
+	# Ports erlauben interen hosts (als FOR-Schleife, da 2018 max. 15 Ports bei --dports pro Zeile erlaubt waren)
+	for inthost in $internal_hosts
+	do
+		if [[ $only_internal_tcp_dports != "" ]]; then
+			for port in $(echo $only_internal_tcp_dports | sed 's/,/ /g')
+			do
+				( set -x; iptables -A myfilter -m state --state NEW -i $DEV1 -p tcp -s $inthost --dport $port -j ACCEPT )
+			done
+		fi
+		if [[ $only_internal_udp_dports != "" ]]; then
+			for port in $(echo $only_internal_udp_dports | sed 's/,/ /g')
+			do
+				( set -x; iptables -A myfilter -m state --state NEW -i $DEV1 -p udp -s $inthost --dport $port -j ACCEPT )
+			done
+		fi
+	done
+
+	# TCP-Ports erlauben externe hosts
+	if [[ $tcp_dports_for_all != "" ]]; then
+		for port in  $(echo $tcp_dports_for_all | sed 's/,/ /g')
+		do
+			( set -x; iptables -A myfilter -m state --state NEW -i $DEV1 -p tcp -s 0/0 --dport $port -j ACCEPT )
+		done
+	fi
+
+	# UDP-Ports erlauben externe hosts
+	if [[ $udp_dports_for_all != "" ]]; then
+		for port in $(echo $udp_dports_for_all | sed 's/,/ /g')
+		do
+			( set -x; iptables -A myfilter -m state --state NEW -i $DEV1 -p udp -s 0/0 --dport $port -j ACCEPT )
+		done
+	fi
+
+	# Ping erlauben
+	( set -x; iptables -A myfilter -p icmp --icmp-type ping -i $DEV1 -j ACCEPT )
+
+	# erlaube weitere Protokollarten (z.B. Protokoll 47 = GPE - noetig fuer PPTP)
+	for protocol in $protocols_for_all
+	do
+		if [[ $protocol != "" ]]; then
+			 ( set -x; iptables -A myfilter -p $protocol -i $DEV1 -j ACCEPT )
+		fi
+	done
+
+	# Spezielle Ports fuer spezielle IP-Adressen freigeben
+	for rule in $(echo $special_rules)
+	do
+		if [[ $rule != "" ]]; then
+			( set -x; iptables -A myfilter -m state --state NEW -i $DEV1 -p `echo $rule | awk -F ':' '{ print $3 }'` -s `echo $rule | awk -F ':' '{ print $1 }'` --dport `echo $rule | awk -F ':' '{ print $2 }'` -j ACCEPT )
+		fi
+	done
+
+	# Port-Weiterleitungen an LOKALE Ports
+	for rule in $(echo $redirect_local_ports)
+	do
+		if [[ $rule != "" ]]; then
+			PROTO=`echo $rule | awk -F ':' '{ print $1 }'`; SOURCEIP=`echo $rule | awk -F ':' '{ print $2 }'`; INIP=`echo $rule | awk -F ':' '{ print $3 }'`; INPORT=`echo $rule | awk -F ':' '{ print $4 }'`; OUTPORT=`echo $rule | awk -F ':' '{ print $5 }'`
+			( set -x; iptables -t nat -A PREROUTING -p $PROTO -s $SOURCEIP -d $INIP --dport $INPORT -j DNAT --to-destination :$OUTPORT )
+		fi
+	done
+
+	# Port-Weiterleitungen an ENTFERNTE Ports (anderer IP-Adressen)
+	for rule in $(echo $redirect_remote_ports)
+	do
+		if [[ $rule != "" ]]; then
+			PROTO=`echo $rule | awk -F ':' '{ print $1 }'`; SOURCEIP=`echo $rule | awk -F ':' '{ print $2 }'`; INPORT=`echo $rule | awk -F ':' '{ print $3 }'`; OUTIP=`echo $rule | awk -F ':' '{ print $4 }'`; OUTPORT=`echo $rule | awk -F ':' '{ print $5 }'`
+			( set -x
+			echo 1 > /proc/sys/net/ipv4/ip_forward
+			iptables -t nat -A PREROUTING -p $PROTO -s $SOURCEIP --dport $INPORT -j DNAT --to-destination $OUTIP:$OUTPORT
+			iptables -t nat -A POSTROUTING -j MASQUERADE )
+		fi
+	done
+
+	# fuehre Kommandos aus $own_commands_at_beginn aus (dies koennen z.B. zusaetzliche iptables-Regeln sein)
+	if [[ $own_commands_before_nat_pat != "" ]]
+	then
+		OIFS=$IFS
+		IFS=$'\n'
+		for run in $own_commands_before_nat_pat
+		do
+			( set -x; eval $run )
+		done
+		IFS=$OIFS
+	fi
+
+	# per NAT/PAT weiterleiten
+	if [[ $destination_nat_pat_posts != "" ]]
+	then
+
+		# erlaube ip_forwarding im Kernel
+		( set -x; echo 1 > /proc/sys/net/ipv4/ip_forward )
+		
+		for nphost in $nat_pat_hosts
+		do
+			( set -x; iptables -t nat -A POSTROUTING -s $nphost -d 0/0 -o $destination_nat_pat_posts -j MASQUERADE )
+		done
+	fi
+
+	## ALLE NICHT ERLAUBTEN PAKETTE sollen ...
+	
+	# Erlaube ALLE Pakette die im Zusammenhang mit einer schon vorhandener Verbindung (egal woher) kommen
+	( set -x; iptables -A myfilter -m state --state ESTABLISHED,RELATED -j ACCEPT )
+
+	#  WEISE ALLE ANDEREN PAKTETE AB
+	( set -x; iptables -A myfilter -i $DEV1 -j REJECT )
+
+	# LOG-Dateien schreiben
+    if [ "${logfile}" != "" ]
+    then
+		( set -x
+        iptables -A FORWARD -m limit --limit 20/min -j LOG --log-prefix '[sysfirewall] '
+        iptables -A INPUT -m limit --limit 20/min -j LOG --log-prefix '[sysfirewall] ' )
+    fi
+
+	## ANWENDEN der Regeln
+    
+    # alle Pakette die durch INPUT oder FORWARD (Standardrouten) gelangen mit den oberen Filtern anwenden
+	( set -x        
+    iptables -A FORWARD -j myfilter
+    iptables -A INPUT -j myfilter )
+
+;;
+
+stop)
+
+	echo
+	echo "STOPING FIREWALL ..."
+	echo
+	
+	# ALLE IPTABLES- (Firewall-) Regeln loeschen
+	iptables --flush
+	iptables --delete-chain myfilter
+	iptables --delete-chain
+	for i in $(echo nat PREROUTING INPUT FORWARD OUTPUT POSTROUTING)
+	do
+		iptables -t $i --flush 2> /dev/null 
+		iptables -t $i --delete-chain 2> /dev/null
+	done
+	
+	echo 0 > /proc/sys/net/ipv4/ip_forward
+;;
+
+status)
+
+	echo; echo "*** CURRENT ALLOWED PORTS ***"; echo
+	iptables -L
+	echo; echo "*** CURRENT NAT/PAT RULES ***"; echo
+	iptables -t nat -L
+
+;;
+
+restart)
+
+	/etc/init.d/firewall stop
+	echo "******************************"
+	/etc/init.d/firewall start
+
+;;
+
+test)
+
+	echo "Starting the firewall for ONLY 60 seconds."
+	/etc/init.d/firewall restart
+	echo "Please CHECK the current firewall settings NOW and change or start the firewall later."
+	sleep 60 
+	/etc/init.d/firewall stop
+	echo "The firewall was STOPED now. Please change or start the firewall, again."
+
+;;
+
+*)
+
+	echo "Usage: $0 {start|stop|status|restart|test}"
+
+;;
+
+
+esac
+
+exit 0
